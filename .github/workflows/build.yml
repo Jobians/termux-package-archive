@@ -1,0 +1,207 @@
+name: Build and Release Termux Package
+
+defaults:
+  run:
+    working-directory: termux-packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: "Package to build"
+        required: true
+      target_version:
+        description: "Version prefix (e.g., 17)"
+        required: true
+      custom_commit:
+        description: "Manual Commit SHA (optional)"
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  CI_PKG_NAME: ${{ github.event.inputs.package_name }}
+  CI_PKG_VERSION: ${{ github.event.inputs.target_version }}
+  MANUAL_SHA: ${{ github.event.inputs.custom_commit }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve_sha.outputs.sha }}
+      pkg_version: ${{ steps.resolve_sha.outputs.pkg_version }}
+      pkg_display_name: ${{ steps.resolve_sha.outputs.pkg_display_name }}
+    steps:
+      - name: Resolve Commit Hash & Version
+        id: resolve_sha
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANUAL_SHA: ${{ github.event.inputs.custom_commit }}
+          CI_PKG_NAME: ${{ github.event.inputs.package_name }}
+          CI_PKG_VERSION: ${{ github.event.inputs.target_version }}
+        run: |
+          if [ -n "$MANUAL_SHA" ]; then
+            echo "Using manual commit: $MANUAL_SHA"
+            RAW_URL="https://raw.githubusercontent.com/termux/termux-packages/$MANUAL_SHA/packages/$CI_PKG_NAME/build.sh"
+            FULL_VERSION=$(curl -s "$RAW_URL" | grep -E "^TERMUX_PKG_VERSION=" | cut -d '=' -f2 | tr -d '"' | tr -d "'")
+            SHA=$MANUAL_SHA
+          else
+            echo "Searching for $CI_PKG_NAME version $CI_PKG_VERSION..."
+            API_URL="https://api.github.com/repos/termux/termux-packages/commits?path=packages/$CI_PKG_NAME/build.sh&per_page=100"
+            COMMITS=$(curl -s -H "Authorization: Bearer $GH_TOKEN" "$API_URL" | jq -r '.[].sha')
+            SHA=""
+            for s in $COMMITS; do
+              RAW_URL="https://raw.githubusercontent.com/termux/termux-packages/$s/packages/$CI_PKG_NAME/build.sh"
+              FULL_VERSION=$(curl -s "$RAW_URL" | grep -E "^TERMUX_PKG_VERSION=" | cut -d '=' -f2 | tr -d '"' | tr -d "'")
+              if [[ $FULL_VERSION == $CI_PKG_VERSION* ]]; then
+                SHA=$s
+                break
+              fi
+            done
+            if [ -z "$SHA" ]; then
+              echo "No matching commit found for $CI_PKG_NAME version $CI_PKG_VERSION"
+              exit 1
+            fi
+          fi
+
+          # Strip epoch if present (TERMUX_PKG_VERSION may be "1:2.6.0")
+          if [[ "$FULL_VERSION" == *:* ]]; then
+            CLEAN_VERSION="${FULL_VERSION#*:}"
+          else
+            CLEAN_VERSION="$FULL_VERSION"
+          fi
+
+          DISPLAY_NAME="${CI_PKG_NAME^}"
+          SAFE_VERSION=$(echo "$CLEAN_VERSION" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          echo "Detected version: $FULL_VERSION → cleaned for display: $SAFE_VERSION"
+
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "pkg_version=$SAFE_VERSION" >> $GITHUB_OUTPUT
+          echo "pkg_display_name=$DISPLAY_NAME" >> $GITHUB_OUTPUT
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    outputs:
+      arch: ${{ matrix.arch }}
+    strategy:
+      matrix:
+        arch: [aarch64]
+      fail-fast: false
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+
+      - name: Checkout Termux Packages
+        uses: actions/checkout@v4
+        with:
+          repository: termux/termux-packages
+          ref: ${{ needs.prepare.outputs.sha }}
+          path: termux-packages
+
+      - name: Enable zram
+        uses: ./.github/actions/zram
+        with:
+          algorithm: zstd
+          size: 16G
+          priority: 100
+          device_name: /dev/zram0
+
+      - name: Set up Ubuntu Environment
+        run: ./scripts/setup-ubuntu.sh
+
+      - name: Set up Android SDK
+        run: yes | ./scripts/setup-android-sdk.sh
+
+      - name: Build Package
+        run: |
+          ./build-package.sh -a ${{ matrix.arch }} "$CI_PKG_NAME"
+
+      - name: Archive built packages
+        if: success()
+        run: |
+          cd output
+          zip -r "../${CI_PKG_NAME}-${{ needs.prepare.outputs.pkg_version }}-${{ matrix.arch }}-bundle.zip" ./*.deb
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.CI_PKG_NAME }}-${{ matrix.arch }}
+          path: termux-packages/${{ env.CI_PKG_NAME }}-*-${{ matrix.arch }}-bundle.zip
+  
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    env:
+      PKG_VERSION: ${{ needs.prepare.outputs.pkg_version }}
+      PKG_DISPLAY_NAME: ${{ needs.prepare.outputs.pkg_display_name }}
+      PKG_SHA: ${{ needs.prepare.outputs.sha }}
+      PKG_ARCH: ${{ needs.build.outputs.arch }}
+      RELEASE_TAG: "${{ github.event.inputs.package_name }}-${{ needs.prepare.outputs.pkg_version }}"
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./release-assets
+          pattern: ${{ env.CI_PKG_NAME }}-*
+          merge-multiple: true
+
+      - name: Extract zips and copy .deb files
+        run: |
+          mkdir -p "${{ github.workspace }}/debs"
+          for zipfile in ./release-assets/${{ env.CI_PKG_NAME }}-*.zip; do
+            unzip -o "$zipfile" -d temp_deb
+            cp temp_deb/${{ env.CI_PKG_NAME }}_*.deb "${{ github.workspace }}/debs/"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "${{ env.RELEASE_TAG }}"
+          name: "${{ env.PKG_DISPLAY_NAME }} v${{ env.PKG_VERSION }}"
+          body: |
+            **Package Details:**
+            - **Upstream SHA:** `${{ env.PKG_SHA }}`
+            - **Architecture:** `${{ env.PKG_ARCH }}`
+
+            ---
+            ## 🛠 Installation Instructions
+
+            ### Option 1: Quick Install (Individual .deb)
+            Run the following commands in Termux to download and install:
+            ```bash
+            curl -L -O https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/${{ env.CI_PKG_NAME }}_${{ env.PKG_VERSION }}_${{ env.PKG_ARCH }}.deb
+            dpkg -i ./${{ env.CI_PKG_NAME }}_${{ env.PKG_VERSION }}_${{ env.PKG_ARCH }}.deb
+            ```
+
+            ### ⚠️ Troubleshooting Dependency Errors
+            If you get an error like:  
+            `dpkg: dependency problems prevent configuration of ... depends on ...`
+
+            **Try fixing it automatically first:**
+            ```bash
+            apt --fix-broken install
+            ```
+
+            ### Option 2: Full Installation (The Bundle)
+            If you get a **conflict error** or `apt --fix-broken` does not work, it means you are missing core libraries.
+
+            **Download the ZIP bundle**, extract it, and install everything inside to ensure all dependencies are met:
+            ```bash
+            # Download the full bundle
+            curl -L -O https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/${{ env.CI_PKG_NAME }}-${{ env.PKG_VERSION }}-${{ env.PKG_ARCH }}-bundle.zip
+
+            # Unzip and install all packages
+            unzip ${{ env.CI_PKG_NAME }}-${{ env.PKG_VERSION }}-${{ env.PKG_ARCH }}-bundle.zip
+            dpkg -i ./*.deb
+            ```
+          files: |
+            ${{ github.workspace }}/debs/${{ env.CI_PKG_NAME }}_*.deb
+            ./release-assets/*-bundle.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
