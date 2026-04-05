@@ -8,13 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       package_name:
-        description: "Package to build"
+        description: 'Package to build'
         required: true
       target_version:
-        description: "Version prefix (e.g., 17)"
+        description: 'Version prefix (e.g., 17)'
         required: true
       custom_commit:
-        description: "Manual Commit SHA (optional)"
+        description: 'Manual Commit SHA (optional)'
         required: false
 
 permissions:
@@ -66,7 +66,7 @@ jobs:
             fi
           fi
 
-          # Strip epoch if present (TERMUX_PKG_VERSION may be "1:2.6.0")
+          # Strip epoch if present
           if [[ "$FULL_VERSION" == *:* ]]; then
             CLEAN_VERSION="${FULL_VERSION#*:}"
           else
@@ -86,6 +86,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       arch: ${{ matrix.arch }}
+      full_filename: ${{ steps.build_info.outputs.full_filename }}
     strategy:
       matrix:
         arch: [aarch64]
@@ -100,54 +101,53 @@ jobs:
           repository: termux/termux-packages
           ref: ${{ needs.prepare.outputs.sha }}
           path: termux-packages
+          fetch-depth: 1
 
-      - name: Apply termux-overrides (version-aware, optional)
+      - name: Apply Termux Overrides
         run: |
-          echo "==== Applying termux-overrides ===="
-          echo "Detected package version: ${{ needs.prepare.outputs.pkg_version }}"
-          echo "Looking in: ${{ github.workspace }}/termux-overrides/"
+          echo "==== Applying Termux Overrides ===="
+          PKG_NAME="$CI_PKG_NAME"
+          BASE_OVERRIDE="${{ github.workspace }}/termux-overrides/$PKG_NAME"
+          PKG_VERSION="${{ needs.prepare.outputs.pkg_version }}"
 
-          for pkg_dir in ${{ github.workspace }}/termux-overrides/*/; do
-            pkg_name=$(basename "$pkg_dir")
-            termux_pkg_path="${{ github.workspace }}/termux-packages/packages/$pkg_name"
+          if [ ! -d "$BASE_OVERRIDE" ]; then
+            echo "No overrides found for $PKG_NAME"
+            exit 0
+          fi
 
-            if [ -d "$termux_pkg_path" ]; then
-              echo "Checking package overrides for '$pkg_name'..."
+          echo "Found overrides for $PKG_NAME in $BASE_OVERRIDE"
+          echo "Package version: $PKG_VERSION"
 
-              # Apply versioned override if exists
-              VERSION_OVERRIDE_DIR="$pkg_dir/${{ needs.prepare.outputs.pkg_version }}"
-              if [ -d "$VERSION_OVERRIDE_DIR" ]; then
-                echo "→ Applying versioned override for $pkg_name v${{ needs.prepare.outputs.pkg_version }} from $VERSION_OVERRIDE_DIR"
-                cp -r "$VERSION_OVERRIDE_DIR"/* "$termux_pkg_path/"
-              else
-                echo "→ No versioned override found for $pkg_name v${{ needs.prepare.outputs.pkg_version }}"
-              fi
+          # 1. Exact match
+          if [ -d "$BASE_OVERRIDE/$PKG_VERSION" ]; then
+            VERSION_DIR="$BASE_OVERRIDE/$PKG_VERSION"
+          # 2. Minor match
+          elif [ -d "$BASE_OVERRIDE/${PKG_VERSION%.*}.x" ]; then
+            VERSION_DIR="$BASE_OVERRIDE/${PKG_VERSION%.*}.x"
+          # 3. Major match
+          elif [ -d "$BASE_OVERRIDE/${PKG_VERSION%%.*}.x" ]; then
+            VERSION_DIR="$BASE_OVERRIDE/${PKG_VERSION%%.*}.x"
+          else
+            echo "No matching override folder, skipping scripts"
+            exit 0
+          fi
 
-              # Apply non-versioned package files (optional)
-              for file in "$pkg_dir"/*; do
-                [ -d "$file" ] && continue   # skip folders
-                echo "→ Applying package override file: $(basename "$file") to $termux_pkg_path"
-                cp "$file" "$termux_pkg_path/"
-              done
-            else
-              echo "→ Package '$pkg_name' not found in termux-packages, skipping"
-            fi
+          echo "Using override folder: $VERSION_DIR"
+
+          # Run only .sh scripts
+          for script in "$VERSION_DIR"/*.sh; do
+            [ -f "$script" ] || continue
+            echo "→ Running override script: $(basename "$script")"
+            (cd "$VERSION_DIR" && bash "$(basename "$script")")
           done
 
-          # Run generic scripts in root
-          for script in ${{ github.workspace }}/termux-overrides/*; do
-            if [ -f "$script" ] && [ -x "$script" ]; then
-              echo "→ Running generic override script: $(basename "$script")"
-              "$script"
-            fi
-          done
-          echo "==== Finished applying termux-overrides ===="
+          echo "==== Finished applying overrides ===="
 
       - name: Enable zram
         uses: ./.github/actions/zram
         with:
           algorithm: zstd
-          size: 16G
+          size: 10G
           priority: 100
           device_name: /dev/zram0
 
@@ -157,14 +157,60 @@ jobs:
       - name: Set up Android SDK
         run: yes | ./scripts/setup-android-sdk.sh
 
-      - name: Build Package
+      - name: Verify Source URLs and Exit on 404
         run: |
-          ./build-package.sh -a ${{ matrix.arch }} "$CI_PKG_NAME"
+          echo "### Verifying Resolved Source URLs"
+          ORDER=$(./scripts/buildorder.py "packages/$CI_PKG_NAME" | awk '{print $2}')
+          FAILED=false
+
+          echo -e "STATUS | PACKAGE | RESOLVED URL"
+          echo -e "-------|---------|-------------"
+
+          for PKG_DIR in $ORDER; do
+            RESOLVED_URL=$(bash -c "
+              TERMUX_PKG_VERSION=0
+              source $PKG_DIR/build.sh 2>/dev/null
+              if [[ \$(declare -p TERMUX_PKG_SRCURL 2>/dev/null) == 'declare -a'* ]]; then
+                echo \"\${TERMUX_PKG_SRCURL[0]}\"
+              else
+                echo \"\$TERMUX_PKG_SRCURL\"
+              fi
+            ")
+
+            if [[ "$RESOLVED_URL" == "http"* ]]; then
+              HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" -L \
+                -A "Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.199 Mobile Safari/537.36" \
+                -r 0-0 --connect-timeout 10 "$RESOLVED_URL")
+              
+              if [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "206" ]]; then
+                echo "  OK   | $(basename $PKG_DIR) | $RESOLVED_URL"
+              elif [[ "$HTTP_STATUS" == "404" ]]; then
+                echo "!! 404 !! | $(basename $PKG_DIR) | $RESOLVED_URL"
+                FAILED=true
+              else
+                echo "!! $HTTP_STATUS !! | $(basename $PKG_DIR) | $RESOLVED_URL"
+              fi
+            else
+              echo " SKIP  | $(basename $PKG_DIR) | (Local Source)"
+            fi
+          done
+
+          if [ "$FAILED" = true ]; then
+            echo ""
+            echo "❌ ERROR: One or more packages returned a 404. Build aborted to save time."
+            exit 1
+          fi
+      
+      - name: Build Package
+        run: ./build-package.sh -a ${{ matrix.arch }} "$CI_PKG_NAME"
 
       - name: Archive built packages
+        id: build_info
         if: success()
         run: |
           cd output
+          FULL_FILENAME=$(ls ${CI_PKG_NAME}_*_*.deb | head -n 1)
+          echo "full_filename=$FULL_FILENAME" >> $GITHUB_OUTPUT
           zip -r "../${CI_PKG_NAME}-${{ needs.prepare.outputs.pkg_version }}-${{ matrix.arch }}-bundle.zip" ./*.deb
 
       - name: Upload Artifact
@@ -172,7 +218,7 @@ jobs:
         with:
           name: ${{ env.CI_PKG_NAME }}-${{ matrix.arch }}
           path: termux-packages/${{ env.CI_PKG_NAME }}-*-${{ matrix.arch }}-bundle.zip
-  
+
   release:
     needs: [prepare, build]
     runs-on: ubuntu-latest
@@ -184,7 +230,7 @@ jobs:
       PKG_DISPLAY_NAME: ${{ needs.prepare.outputs.pkg_display_name }}
       PKG_SHA: ${{ needs.prepare.outputs.sha }}
       PKG_ARCH: ${{ needs.build.outputs.arch }}
-      RELEASE_TAG: "${{ github.event.inputs.package_name }}-${{ needs.prepare.outputs.pkg_version }}"
+      RELEASE_TAG: '${{ github.event.inputs.package_name }}-${{ needs.prepare.outputs.pkg_version }}'
     steps:
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
@@ -204,8 +250,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "${{ env.RELEASE_TAG }}"
-          name: "${{ env.PKG_DISPLAY_NAME }} v${{ env.PKG_VERSION }}"
+          tag_name: '${{ env.RELEASE_TAG }}'
+          name: '${{ env.PKG_DISPLAY_NAME }} v${{ env.PKG_VERSION }}'
           body: |
             **Package Details:**
             - **Upstream SHA:** `${{ env.PKG_SHA }}`
@@ -217,8 +263,8 @@ jobs:
             ### Option 1: Quick Install (Individual .deb)
             Run the following commands in Termux to download and install:
             ```bash
-            curl -L -O https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/${{ env.CI_PKG_NAME }}_${{ env.PKG_VERSION }}_${{ env.PKG_ARCH }}.deb
-            dpkg -i ./${{ env.CI_PKG_NAME }}_${{ env.PKG_VERSION }}_${{ env.PKG_ARCH }}.deb
+            curl -L -O "https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ env.RELEASE_TAG }}/${{ needs.build.outputs.full_filename }}"
+            dpkg -i ./${{ needs.build.outputs.full_filename }}
             ```
 
             ### ⚠️ Troubleshooting Dependency Errors
@@ -235,10 +281,7 @@ jobs:
 
             **Download the ZIP bundle**, extract it, and install everything inside to ensure all dependencies are met:
             ```bash
-            # Download the full bundle
-            curl -L -O https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/${{ env.CI_PKG_NAME }}-${{ env.PKG_VERSION }}-${{ env.PKG_ARCH }}-bundle.zip
-
-            # Unzip and install all packages
+            curl -L -O "https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/${{ env.CI_PKG_NAME }}-${{ env.PKG_VERSION }}-${{ env.PKG_ARCH }}-bundle.zip"
             unzip ${{ env.CI_PKG_NAME }}-${{ env.PKG_VERSION }}-${{ env.PKG_ARCH }}-bundle.zip
             dpkg -i ./*.deb
             ```
