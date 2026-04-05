@@ -101,6 +101,37 @@ jobs:
           ref: ${{ needs.prepare.outputs.sha }}
           path: termux-packages
 
+      - name: Apply termux-overrides (version-aware, optional)
+        run: |
+          echo "Applying termux-overrides..."
+          for pkg_dir in ${{ github.workspace }}/termux-overrides/*/; do
+            pkg_name=$(basename "$pkg_dir")
+            termux_pkg_path="${{ github.workspace }}/termux-packages/packages/$pkg_name"
+
+            if [ -d "$termux_pkg_path" ]; then
+              # Apply versioned override if exists
+              VERSION_OVERRIDE_DIR="$pkg_dir/${{ needs.prepare.outputs.pkg_version }}"
+              if [ -d "$VERSION_OVERRIDE_DIR" ]; then
+                echo "Applying versioned overrides for $pkg_name v${{ needs.prepare.outputs.pkg_version }}"
+                cp -r "$VERSION_OVERRIDE_DIR"/* "$termux_pkg_path/"
+              fi
+
+              # Apply non-versioned package files (optional)
+              for file in "$pkg_dir"/*; do
+                [ -d "$file" ] && continue
+                cp "$file" "$termux_pkg_path/"
+              done
+            fi
+          done
+
+          # Run generic scripts in root
+          for script in ${{ github.workspace }}/termux-overrides/*; do
+            if [ -f "$script" ] && [ -x "$script" ]; then
+              echo "Running generic override script: $script"
+              "$script"
+            fi
+          done
+
       - name: Enable zram
         uses: ./.github/actions/zram
         with:
