@@ -103,34 +103,45 @@ jobs:
 
       - name: Apply termux-overrides (version-aware, optional)
         run: |
-          echo "Applying termux-overrides..."
+          echo "==== Applying termux-overrides ===="
+          echo "Detected package version: ${{ needs.prepare.outputs.pkg_version }}"
+          echo "Looking in: ${{ github.workspace }}/termux-overrides/"
+
           for pkg_dir in ${{ github.workspace }}/termux-overrides/*/; do
             pkg_name=$(basename "$pkg_dir")
             termux_pkg_path="${{ github.workspace }}/termux-packages/packages/$pkg_name"
 
             if [ -d "$termux_pkg_path" ]; then
+              echo "Checking package overrides for '$pkg_name'..."
+
               # Apply versioned override if exists
               VERSION_OVERRIDE_DIR="$pkg_dir/${{ needs.prepare.outputs.pkg_version }}"
               if [ -d "$VERSION_OVERRIDE_DIR" ]; then
-                echo "Applying versioned overrides for $pkg_name v${{ needs.prepare.outputs.pkg_version }}"
+                echo "→ Applying versioned override for $pkg_name v${{ needs.prepare.outputs.pkg_version }} from $VERSION_OVERRIDE_DIR"
                 cp -r "$VERSION_OVERRIDE_DIR"/* "$termux_pkg_path/"
+              else
+                echo "→ No versioned override found for $pkg_name v${{ needs.prepare.outputs.pkg_version }}"
               fi
 
               # Apply non-versioned package files (optional)
               for file in "$pkg_dir"/*; do
-                [ -d "$file" ] && continue
+                [ -d "$file" ] && continue   # skip folders
+                echo "→ Applying package override file: $(basename "$file") to $termux_pkg_path"
                 cp "$file" "$termux_pkg_path/"
               done
+            else
+              echo "→ Package '$pkg_name' not found in termux-packages, skipping"
             fi
           done
 
           # Run generic scripts in root
           for script in ${{ github.workspace }}/termux-overrides/*; do
             if [ -f "$script" ] && [ -x "$script" ]; then
-              echo "Running generic override script: $script"
+              echo "→ Running generic override script: $(basename "$script")"
               "$script"
             fi
           done
+          echo "==== Finished applying termux-overrides ===="
 
       - name: Enable zram
         uses: ./.github/actions/zram
