@@ -77,6 +77,26 @@ dpkg -i ./*.deb
 
 ---
 
+## Advanced: Using Overrides
+
+You can apply custom patches or scripts to any package using overrides:
+
+1. Create a folder: `termux-overrides/<package_name>/<version>/` in your fork.
+2. Add `.sh` scripts to modify the build. Example:
+
+```
+termux-overrides/
+└── python/
+    └── 3.11.5/
+        └── patch-dependency.sh
+```
+
+The workflow automatically detects overrides and runs all `.sh` scripts before building.
+
+Supports exact version, minor (x), or major (x) matching (e.g., `3.11.5`, `3.11.x`, `3.x`).
+
+---
+
 ## FAQ
 
 **Why can't I just use `apt install package=version`?**  
