@@ -263,7 +263,7 @@ jobs:
             ### Option 1: Quick Install (Individual .deb)
             Run the following commands in Termux to download and install:
             ```bash
-            curl -L -O "https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ env.RELEASE_TAG }}/${{ needs.build.outputs.full_filename }}"
+            curl -L -O "https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/${{ needs.build.outputs.full_filename }}"
             dpkg -i ./${{ needs.build.outputs.full_filename }}
             ```
 
