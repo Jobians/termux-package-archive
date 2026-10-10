@@ -1,3 +1,6 @@
+package_name: python
+target_version: 3.11
+
 name: Build and Release Termux Package
 
 defaults:
